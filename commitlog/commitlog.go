@@ -1,26 +1,41 @@
 package commitlog
 
 import (
+	"encoding/binary"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/pkg/errors"
 )
 
+var (
+	ErrSegmentNotFound = errors.New("segment not found")
+	Encoding           = binary.BigEndian
+)
+
+const (
+	LogFileSuffix   = ".log"
+	IndexFileSuffix = ".index"
+)
+
 type CommitLog struct {
 	Options
+	cleaner        Cleaner
 	name           string
 	mu             sync.RWMutex
-	segments       []*segment
+	segments       []*Segment
 	vActiveSegment atomic.Value
 }
 
 type Options struct {
-	Path         string
-	SegmentBytes int64
+	Path            string
+	MaxSegmentBytes int64
+	MaxLogBytes     int64
 }
 
 func New(opts Options) (*CommitLog, error) {
@@ -28,7 +43,7 @@ func New(opts Options) (*CommitLog, error) {
 		return nil, errors.New("path is empty")
 	}
 
-	if opts.SegmentBytes == 0 {
+	if opts.MaxSegmentBytes == 0 {
 		// TODO default here
 	}
 
@@ -36,6 +51,15 @@ func New(opts Options) (*CommitLog, error) {
 	l := &CommitLog{
 		Options: opts,
 		name:    filepath.Base(path),
+		cleaner: NewDeleteCleaner(opts.MaxLogBytes),
+	}
+
+	if err := l.init(); err != nil {
+		return nil, err
+	}
+
+	if err := l.open(); err != nil {
+		return nil, err
 	}
 
 	return l, nil
@@ -50,37 +74,63 @@ func (l *CommitLog) init() error {
 }
 
 func (l *CommitLog) open() error {
-	_, err := ioutil.ReadDir(l.Path)
+	files, err := ioutil.ReadDir(l.Path)
 	if err != nil {
 		return errors.Wrap(err, "read dir failed")
 	}
-
-	activeSegment, err := NewSegment(l.Path, 0, l.SegmentBytes)
-	if err != nil {
-		return err
+	for _, file := range files {
+		// if this file is an index file, make sure it has a corresponding .log file
+		if strings.HasSuffix(file.Name(), IndexFileSuffix) {
+			_, err := os.Stat(filepath.Join(l.Path, strings.Replace(file.Name(), IndexFileSuffix, LogFileSuffix, 1)))
+			if os.IsNotExist(err) {
+				if err := os.Remove(file.Name()); err != nil {
+					return err
+				}
+			} else if err != nil {
+				return errors.Wrap(err, "stat file failed")
+			}
+		} else if strings.HasSuffix(file.Name(), LogFileSuffix) {
+			offsetStr := strings.TrimSuffix(file.Name(), LogFileSuffix)
+			baseOffset, err := strconv.Atoi(offsetStr)
+			segment, err := NewSegment(l.Path, int64(baseOffset), l.MaxSegmentBytes)
+			if err != nil {
+				return err
+			}
+			l.segments = append(l.segments, segment)
+		}
 	}
-	l.vActiveSegment.Store(activeSegment)
-
-	l.segments = append(l.segments, activeSegment)
-
+	if len(l.segments) == 0 {
+		segment, err := NewSegment(l.Path, 0, l.MaxSegmentBytes)
+		if err != nil {
+			return err
+		}
+		l.segments = append(l.segments, segment)
+	}
+	l.vActiveSegment.Store(l.segments[len(l.segments)-1])
 	return nil
 }
 
-func (l *CommitLog) deleteAll() error {
-	return os.RemoveAll(l.Path)
-}
-
-func (l *CommitLog) Write(p []byte) (n int, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+func (l *CommitLog) Append(b []byte) (offset int64, err error) {
+	ms := MessageSet(b)
 	if l.checkSplit() {
-		if err = l.split(); err != nil {
-			return 0, err
+		if err := l.split(); err != nil {
+			return offset, err
 		}
 	}
-
-	return l.activeSegment().Write(p)
+	position := l.activeSegment().Position
+	offset = l.activeSegment().NextOffset
+	ms.PutOffset(offset)
+	if _, err := l.activeSegment().Write(ms); err != nil {
+		return offset, err
+	}
+	e := Entry{
+		Offset:   offset,
+		Position: position,
+	}
+	if err := l.activeSegment().Index.WriteEntry(e); err != nil {
+		return offset, err
+	}
+	return offset, nil
 }
 
 func (l *CommitLog) Read(p []byte) (n int, err error) {
@@ -89,24 +139,78 @@ func (l *CommitLog) Read(p []byte) (n int, err error) {
 	return l.activeSegment().Read(p)
 }
 
+func (l *CommitLog) NewestOffset() int64 {
+	return l.activeSegment().NextOffset
+}
+
+func (l *CommitLog) OldestOffset() int64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.segments[0].BaseOffset
+}
+
+func (l *CommitLog) activeSegment() *Segment {
+	return l.vActiveSegment.Load().(*Segment)
+}
+
+func (l *CommitLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, segment := range l.segments {
+		if err := segment.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *CommitLog) DeleteAll() error {
+	if err := l.Close(); err != nil {
+		return err
+	}
+	return os.RemoveAll(l.Path)
+}
+
+func (l *CommitLog) TruncateTo(offset int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var segments []*Segment
+	for _, segment := range l.segments {
+		if segment.BaseOffset < offset {
+			if err := segment.Delete(); err != nil {
+				return err
+			}
+		} else {
+			segments = append(segments, segment)
+		}
+	}
+	l.segments = segments
+	return nil
+}
+
+func (l *CommitLog) Segments() []*Segment {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segments
+}
+
 func (l *CommitLog) checkSplit() bool {
 	return l.activeSegment().IsFull()
 }
 
 func (l *CommitLog) split() error {
-	seg, err := NewSegment(l.Path, l.newestOffset(), l.SegmentBytes)
+	segment, err := NewSegment(l.Path, l.NewestOffset(), l.MaxSegmentBytes)
 	if err != nil {
 		return err
 	}
-	l.segments = append(l.segments, seg)
-	l.vActiveSegment.Store(seg)
+	l.mu.Lock()
+	segments := append(l.segments, segment)
+	segments, err = l.cleaner.Clean(segments)
+	if err != nil {
+		return err
+	}
+	l.segments = segments
+	l.mu.Unlock()
+	l.vActiveSegment.Store(segment)
 	return nil
-}
-
-func (l *CommitLog) newestOffset() int64 {
-	return l.activeSegment().NextOffset()
-}
-
-func (l *CommitLog) activeSegment() *segment {
-	return l.vActiveSegment.Load().(*segment)
 }

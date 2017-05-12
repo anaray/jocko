@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"sync"
 
 	"github.com/pkg/errors"
 
-	"launchpad.net/gommap"
+	"github.com/tysontate/gommap"
+)
+
+var (
+	ErrIndexCorrupt = errors.New("corrupt index file")
 )
 
 const (
@@ -22,30 +27,31 @@ const (
 
 type index struct {
 	options
-	mmap   gommap.MMap
-	file   *os.File
-	offset int64
+	mmap     gommap.MMap
+	file     *os.File
+	mu       sync.RWMutex
+	position int64
 }
 
-type entry struct {
+type Entry struct {
 	Offset   int64
 	Position int64
 }
 
-// relEntry is an entry relative to the base offset
+// relEntry is an Entry relative to the base offset
 type relEntry struct {
-	Offset   int8
-	Position int8
+	Offset   int32
+	Position int32
 }
 
-func newRelEntry(e entry, baseOffset int64) relEntry {
+func newRelEntry(e Entry, baseOffset int64) relEntry {
 	return relEntry{
-		Offset:   int8(e.Offset - baseOffset),
-		Position: int8(e.Position),
+		Offset:   int32(e.Offset - baseOffset),
+		Position: int32(e.Position),
 	}
 }
 
-func (rel relEntry) fill(e *entry, baseOffset int64) {
+func (rel relEntry) fill(e *Entry, baseOffset int64) {
 	e.Offset = baseOffset + int64(rel.Offset)
 	e.Position = int64(rel.Position)
 }
@@ -60,31 +66,26 @@ func newIndex(opts options) (idx *index, err error) {
 	if opts.bytes == 0 {
 		opts.bytes = 10 * 1024 * 1024
 	}
-
 	if opts.path == "" {
 		return nil, errors.New("path is empty")
 	}
-
 	idx = &index{
 		options: opts,
 	}
-	idx.file, err = os.OpenFile(opts.path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	idx.file, err = os.OpenFile(opts.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, errors.Wrap(err, "open file failed")
 	}
 	fi, err := idx.file.Stat()
 	if err != nil {
-		return nil, errors.Wrap(err, "file stat failed")
+		return nil, errors.Wrap(err, "stat file failed")
+	} else if fi.Size() > 0 {
+		idx.position = fi.Size()
 	}
-	size := fi.Size()
-	if size == 0 {
-		// "Truncate" ensures the file will fit the indexes
-		err := idx.file.Truncate(opts.bytes)
-		if err != nil {
-			return nil, errors.Wrap(err, "file truncate failed")
-		}
+	if err := idx.file.Truncate(roundDown(opts.bytes, entryWidth)); err != nil {
+		return nil, err
 	}
-	idx.offset = size
+
 	idx.mmap, err = gommap.Map(idx.file.Fd(), gommap.PROT_READ|gommap.PROT_WRITE, gommap.MAP_SHARED)
 	if err != nil {
 		return nil, errors.Wrap(err, "mmap file failed")
@@ -92,47 +93,53 @@ func newIndex(opts options) (idx *index, err error) {
 	return idx, nil
 }
 
-func (idx *index) WriteEntry(entry entry) (err error) {
+func (idx *index) WriteEntry(entry Entry) (err error) {
 	b := new(bytes.Buffer)
 	relEntry := newRelEntry(entry, idx.baseOffset)
-	if err = binary.Write(b, binary.BigEndian, relEntry); err != nil {
+	if err = binary.Write(b, Encoding, relEntry); err != nil {
 		return errors.Wrap(err, "binary write failed")
 	}
-	if _, err = idx.WriteAt(b.Bytes(), idx.offset); err != nil {
-		return err
-	}
-	idx.offset += entryWidth
+	idx.WriteAt(b.Bytes(), idx.position)
+	idx.mu.Lock()
+	idx.position += entryWidth
+	idx.mu.Unlock()
 	return nil
 }
 
-func (idx *index) ReadEntry(e *entry, offset int64) error {
+func (idx *index) ReadEntry(e *Entry, offset int64) error {
 	p := make([]byte, entryWidth)
-	copy(p, idx.mmap[offset:offset+entryWidth])
+	idx.ReadAt(p, offset)
 	b := bytes.NewReader(p)
 	rel := &relEntry{}
-	err := binary.Read(b, binary.BigEndian, rel)
+	err := binary.Read(b, Encoding, rel)
 	if err != nil {
-		return errors.Wrap(err, "binar read failed")
+		return errors.Wrap(err, "binary read failed")
 	}
+	idx.mu.RLock()
 	rel.fill(e, idx.baseOffset)
+	idx.mu.RUnlock()
 	return nil
 }
 
-func (idx *index) ReadAt(p []byte, offset int64) (n int, err error) {
-	n = copy(idx.mmap[idx.offset:idx.offset+entryWidth], []byte("hellohellomanman"))
-	return n, nil
+func (idx *index) ReadAt(p []byte, offset int64) (n int) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return copy(p, idx.mmap[offset:offset+entryWidth])
 }
 
 func (idx *index) Write(p []byte) (n int, err error) {
-	return idx.WriteAt(p, idx.offset)
+	return idx.WriteAt(p, idx.position), nil
 }
 
-func (idx *index) WriteAt(p []byte, offset int64) (n int, err error) {
-	n = copy(idx.mmap[offset:offset+entryWidth], p)
-	return n, nil
+func (idx *index) WriteAt(p []byte, offset int64) (n int) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return copy(idx.mmap[offset:offset+entryWidth], p)
 }
 
 func (idx *index) Sync() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 	if err := idx.file.Sync(); err != nil {
 		return errors.Wrap(err, "file sync failed")
 	}
@@ -143,5 +150,45 @@ func (idx *index) Sync() error {
 }
 
 func (idx *index) Close() (err error) {
+	if err = idx.Sync(); err != nil {
+		return
+	}
+	if err = idx.file.Truncate(idx.position); err != nil {
+		return
+	}
 	return idx.file.Close()
+}
+
+func (idx *index) Name() string {
+	return idx.file.Name()
+}
+
+func (idx *index) TruncateEntries(number int) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if int64(number*entryWidth) > idx.position {
+		return errors.New("bad truncate number")
+	}
+	idx.position = int64(number * entryWidth)
+	return nil
+}
+
+func (idx *index) SanityCheck() error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.position == 0 {
+		return nil
+	} else if idx.position%entryWidth != 0 {
+		return ErrIndexCorrupt
+	} else {
+		//read last entry
+		entry := new(Entry)
+		if err := idx.ReadEntry(entry, idx.position-entryWidth); err != nil {
+			return err
+		}
+		if entry.Offset < idx.baseOffset {
+			return ErrIndexCorrupt
+		}
+		return nil
+	}
 }

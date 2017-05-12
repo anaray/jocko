@@ -3,54 +3,56 @@ package commitlog
 import (
 	"io"
 	"sync"
-
-	"github.com/pkg/errors"
 )
 
 type Reader struct {
-	segment  *segment
-	segments []*segment
-	idx      int
-	mu       sync.Mutex
-	offset   int64
+	commitlog *CommitLog
+	idx       int
+	mu        sync.Mutex
+	position  int64
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	segments := r.commitlog.Segments()
+	segment := segments[r.idx]
+
 	var readSize int
 	for {
-		readSize, err = r.segment.ReadAt(p[n:], r.offset)
+		readSize, err = segment.ReadAt(p[n:], r.position)
 		n += readSize
-		if err != io.EOF {
+		r.position += int64(readSize)
+		if readSize != 0 && err == nil {
+			continue
+		}
+		if n == len(p) || err != io.EOF {
 			break
 		}
-		r.idx++
-		if len(r.segments) <= r.idx {
+		if len(segments) <= r.idx+1 {
 			err = io.EOF
 			break
 		}
-		r.segment = r.segments[r.idx]
-		r.offset = 0
+		r.idx++
+		segment = segments[r.idx]
+		r.position = 0
 	}
 
 	return n, err
 }
 
-func (l *CommitLog) NewReader(offset int64) (r *Reader, err error) {
-	segment, idx := findSegment(l.segments, offset)
-	entry, _ := segment.findEntry(offset)
-	offset = int64(entry.Position)
-
+func (l *CommitLog) NewReader(offset int64, maxBytes int32) (io.Reader, error) {
+	segment, idx := findSegment(l.Segments(), offset)
 	if segment == nil {
-		return nil, errors.Wrap(err, "segment not found")
+		return nil, ErrSegmentNotFound
 	}
+	entry, _ := segment.findEntry(offset)
+	position := entry.Position
 
 	return &Reader{
-		segment:  segment,
-		segments: l.segments,
-		idx:      idx,
-		offset:   offset,
+		commitlog: l,
+		idx:       idx,
+		position:  position,
 	}, nil
 }
